@@ -171,6 +171,7 @@ jobs:
       - name: OWASP ZAP Full Scan
         run: |
           mkdir -p reports/zap
+          chmod -R a+rwx reports/zap
           set +e
           docker run --rm --network host -v "$GITHUB_WORKSPACE/.zap:/zap/wrk/.zap:ro" -v "$GITHUB_WORKSPACE/reports/zap:/zap/wrk/reports:rw" ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t http://127.0.0.1:8000 -c /zap/wrk/.zap/rules.tsv -r /zap/wrk/reports/zap.html -J /zap/wrk/reports/zap.json -x /zap/wrk/reports/zap.xml -w /zap/wrk/reports/zap.md -a
           zap_exit=$?
