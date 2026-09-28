@@ -1,0 +1,1 @@
+Pruebas locales: 29 passed\nCobertura: 96.77%\nUmbral requerido: 80%\nResultado: PASS\n
