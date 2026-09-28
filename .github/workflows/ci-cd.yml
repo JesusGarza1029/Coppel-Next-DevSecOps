@@ -1,0 +1,224 @@
+name: Coppel Next - CI/CD DevSecOps
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coppel-next-donantes-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  IMAGE_NAME: coppel-next-donantes
+  K8S_NAMESPACE: coppel-staging
+  SONAR_PROJECT_KEY: coppel-next-donantes
+  SONARQUBE_IMAGE: sonarqube:community
+
+jobs:
+  test-and-quality:
+    name: Tests + cobertura + SonarQube
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m pip check
+
+      - name: Unit and security tests
+        run: |
+          pytest -q --cov=app --cov-report=xml --cov-report=html --cov-report=term-missing --cov-fail-under=80
+
+      - name: Upload test evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-evidence
+          path: |
+            coverage.xml
+            coverage_html/
+
+      - name: Start ephemeral SonarQube Community
+        run: |
+          docker run -d --name sonarqube -p 9000:9000 -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true "${SONARQUBE_IMAGE}"
+          for i in {1..90}; do
+            status=$(curl -s http://127.0.0.1:9000/api/system/status | python -c "import json,sys; print(json.load(sys.stdin).get('status',''))" || true)
+            if [ "$status" = "UP" ]; then break; fi
+            sleep 5
+          done
+          test "$(curl -s http://127.0.0.1:9000/api/system/status | python -c "import json,sys; print(json.load(sys.stdin).get('status',''))")" = "UP"
+
+      - name: Create SonarQube token
+        id: sonar-token
+        run: |
+          SONAR_ADMIN_PASSWORD="Temp-$(openssl rand -hex 16)"
+          curl --fail --silent --show-error -u admin:admin -X POST 'http://127.0.0.1:9000/api/users/change_password' --data-urlencode "login=admin" --data-urlencode "previousPassword=admin" --data-urlencode "password=${SONAR_ADMIN_PASSWORD}"
+          token=$(curl --fail --silent --show-error -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST 'http://127.0.0.1:9000/api/user_tokens/generate' --data-urlencode "name=github-actions-${GITHUB_RUN_ID}" | python -c "import json,sys; print(json.load(sys.stdin)['token'])")
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+
+      - name: Create SonarQube project
+        env:
+          SONAR_TOKEN: ${{ steps.sonar-token.outputs.token }}
+        run: |
+          curl --fail --silent --show-error -H "Authorization: Bearer ${SONAR_TOKEN}" -X POST 'http://127.0.0.1:9000/api/projects/create' --data-urlencode 'project=coppel-next-donantes' --data-urlencode 'name=Coppel Next - Registro de Donantes' || true
+
+      - name: SonarQube analysis
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ steps.sonar-token.outputs.token }}
+          SONAR_HOST_URL: http://127.0.0.1:9000
+        with:
+          args: >-
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+
+      - name: SonarQube Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1.2.0
+        with:
+          pollingTimeoutSec: 600
+        env:
+          SONAR_TOKEN: ${{ steps.sonar-token.outputs.token }}
+          SONAR_HOST_URL: http://127.0.0.1:9000
+
+      - name: Export SonarQube metrics
+        run: |
+          mkdir -p reports
+          curl --fail --silent --show-error --header "Authorization: Bearer ${{ steps.sonar-token.outputs.token }}" "http://127.0.0.1:9000/api/measures/component?component=coppel-next-donantes&metricKeys=bugs,vulnerabilities,security_hotspots,code_smells,coverage,duplicated_lines_density,sqale_index,ncloc,tests,test_failures,alert_status" | tee sonar-metrics.json
+          python scripts/sonar_metrics_report.py sonar-metrics.json reports/sonarqube_metrics.md
+
+      - name: Upload SonarQube evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-evidence
+          path: |
+            sonar-metrics.json
+            reports/sonarqube_metrics.md
+            .scannerwork/report-task.txt
+
+      - name: Stop SonarQube
+        if: always()
+        run: docker rm -f sonarqube || true
+
+  docker-and-staging:
+    name: Docker + Kubernetes staging + smoke + ZAP DAST
+    needs: test-and-quality
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build --pull --tag ${{ env.IMAGE_NAME }}:staging .
+
+      - name: Create ephemeral Kubernetes cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: coppel-staging
+
+      - name: Load image into kind
+        run: kind load docker-image ${{ env.IMAGE_NAME }}:staging --name coppel-staging
+
+      - name: Create staging namespace
+        run: kubectl create namespace ${{ env.K8S_NAMESPACE }}
+
+      - name: Create staging secrets
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          test -n "$JWT_SECRET" || { echo "Falta JWT_SECRET"; exit 1; }
+          test ${#JWT_SECRET} -ge 32 || { echo "JWT_SECRET demasiado corto"; exit 1; }
+          test -n "$ADMIN_PASSWORD" || { echo "Falta ADMIN_PASSWORD"; exit 1; }
+          test ${#ADMIN_PASSWORD} -ge 12 || { echo "ADMIN_PASSWORD demasiado corto"; exit 1; }
+          kubectl -n ${K8S_NAMESPACE} create secret generic coppel-next-donantes-secrets --from-literal=jwt-secret="$JWT_SECRET" --from-literal=admin-password="$ADMIN_PASSWORD"
+
+      - name: Deploy to Kubernetes staging
+        run: kubectl apply -f k8s/staging.yaml
+
+      - name: Wait for rollout
+        run: kubectl -n ${K8S_NAMESPACE} rollout status deployment/coppel-next-donantes --timeout=180s
+
+      - name: Port-forward staging
+        run: |
+          kubectl -n ${K8S_NAMESPACE} port-forward --address 0.0.0.0 service/coppel-next-donantes 8000:80 >/tmp/coppel-port-forward.log 2>&1 &
+          for i in {1..30}; do curl --silent --fail http://127.0.0.1:8000/health && exit 0; sleep 2; done
+          cat /tmp/coppel-port-forward.log
+          exit 1
+
+      - name: Smoke test staging
+        run: |
+          curl --fail http://127.0.0.1:8000/health
+          curl --fail http://127.0.0.1:8000/openapi.json >/dev/null
+
+      - name: OWASP ZAP Full Scan
+        run: |
+          mkdir -p reports/zap
+          set +e
+          docker run --rm --network host -v "$GITHUB_WORKSPACE/.zap:/zap/wrk/.zap:ro" -v "$GITHUB_WORKSPACE/reports/zap:/zap/wrk/reports:rw" ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t http://127.0.0.1:8000 -c /zap/wrk/.zap/rules.tsv -r /zap/wrk/reports/zap.html -J /zap/wrk/reports/zap.json -x /zap/wrk/reports/zap.xml -w /zap/wrk/reports/zap.md -a
+          zap_exit=$?
+          set -e
+          echo "ZAP_EXIT=${zap_exit}" | tee reports/zap/exit-code.txt
+          test -f reports/zap/zap.json
+          python scripts/check_zap_report.py reports/zap/zap.json
+
+      - name: Upload ZAP evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-full-scan
+          path: reports/zap/
+
+      - name: Upload Kubernetes diagnostics
+        if: always()
+        run: |
+          kubectl -n ${K8S_NAMESPACE} get pods -o wide | tee k8s-pods.txt
+          kubectl -n ${K8S_NAMESPACE} get deployment,service | tee k8s-resources.txt
+          kubectl -n ${K8S_NAMESPACE} logs deployment/coppel-next-donantes --all-containers=true > k8s-logs.txt 2>&1 || true
+
+      - name: Upload staging evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-evidence
+          path: |
+            k8s-pods.txt
+            k8s-resources.txt
+            k8s-logs.txt
+
+      - name: Cleanup cluster
+        if: always()
+        run: kind delete cluster --name coppel-staging || true
+
+  security-regression:
+    name: Regression específica de seguridad
+    needs: test-and-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Security regression tests
+        run: pytest -q tests/test_security.py
