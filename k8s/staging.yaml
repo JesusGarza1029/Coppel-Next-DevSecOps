@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coppel-next-donantes
+  namespace: coppel-staging
+  labels:
+    app: coppel-next-donantes
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: coppel-next-donantes
+  template:
+    metadata:
+      labels:
+        app: coppel-next-donantes
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: api
+          image: coppel-next-donantes:staging
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: ENVIRONMENT
+              value: production
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: coppel-next-donantes-secrets
+                  key: jwt-secret
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: coppel-next-donantes-secrets
+                  key: admin-password
+            - name: DONANTES_DB
+              value: /app/data/donantes.db
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: app-data
+              mountPath: /app/data
+      volumes:
+        - name: app-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coppel-next-donantes
+  namespace: coppel-staging
+spec:
+  selector:
+    app: coppel-next-donantes
+  ports:
+    - port: 80
+      targetPort: 8000
+  type: ClusterIP
